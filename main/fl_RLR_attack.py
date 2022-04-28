@@ -1,6 +1,13 @@
 import sys, os
-
-sys.path.append(os.path.abspath('..'))
+sys.path.append(os.path.abspath('../..'))
+import os
+import warnings
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
+sys.path.append(os.path.abspath('../..'))
 
 import copy
 import time
@@ -24,6 +31,7 @@ from trojan.prop import train_model, evaluate
 from config import parse_args
 from model.gcn import GCN
 from model.sage import GraphSAGE
+from collections import OrderedDict
 
 
 class GraphBackdoor:
@@ -49,6 +57,8 @@ class GraphBackdoor:
 
     def run(self):
         loaders = {}
+        # pc_trim = 0.05
+        threshold = args.rlr_thres
         for i in range(args.num_client):
             loaders['client_{}'.format(i)] = {}
             for split in ['train', 'test']:
@@ -106,12 +116,15 @@ class GraphBackdoor:
         predict_fn = lambda output: output.max(1, keepdim=True)[1].detach().cpu()
         loss_fn = F.cross_entropy
         # training
+        glb_optimizer = optim.Adam(list(
+            filter(lambda p: p.requires_grad, global_model.parameters())), lr=args.lr, weight_decay=args.weight_decay,
+            betas=(0.5, 0.999))
         global_model.to(self.cuda)
         global_model.train()
 
         for e in range(args.fl_epochs):
             print("FL update step {}".format(e))
-            local_weights = []
+            local_grad = []
             for i in range(args.num_client):
                 if (i in self.cp_client):
                     continue
@@ -151,7 +164,9 @@ class GraphBackdoor:
                                                                                                        time_iter / (
                                                                                                                batch_id + 1)))
                 model.to(self.cpu)
-                local_weights.append(copy.deepcopy(model.state_dict()))
+                local_weight = model.state_dict()
+                local_grad.append(
+                    OrderedDict({k: (global_weights[k] - local_weight[k]) for k in global_weights.keys()}))
 
             # backdoor
             cp_model.load_state_dict(global_weights)
@@ -213,16 +228,35 @@ class GraphBackdoor:
 
                     cp_model = train_model(self.args, bkd_dr_train, cp_model, list(set(pset)), list(set(nset)))
             cp_model.to(self.cpu)
-            local_weights.append(copy.deepcopy(cp_model.state_dict()))
+            local_weight = cp_model.state_dict()
+            local_grad.append(OrderedDict({k: (global_weights[k] - local_weight[k]) for k in global_weights.keys()}))
+            # local_weights.append(copy.deepcopy(cp_model.state_dict()))
             """
                 Update global model
             """
+            global_grads = []
+            mask_all = []
+            for hlayer in local_grad[0].keys():
+                parameters_h = [torch.flatten(t[hlayer]) for t in local_grad]
+                parameters_h = torch.stack(parameters_h)
+                parameters_h_sign = torch.sign(parameters_h)
+                parameters_h_sum = sum(parameters_h_sign)
+                mask = torch.where(parameters_h_sum >= threshold, torch.ones_like(parameters_h_sum),
+                                   -torch.ones_like(parameters_h_sum))
+                mask_all.append(mask)
+                global_grads.append(torch.mul(torch.div(parameters_h_sum, 100), mask).view(
+                    local_grad[0][hlayer].size()))
+
             global_model.to(self.cpu)
-            global_weights = copy.deepcopy(local_weights[0])
-            for key in global_weights.keys():
-                for i in range(1, len(local_weights)):
-                    global_weights[key] += local_weights[i][key]
-                global_weights[key] = torch.div(global_weights[key], len(local_weights))
+            for p, g in zip(global_model.parameters(), global_grads):
+                p.grad = g
+            glb_optimizer.step()
+
+            # global_weights = copy.deepcopy(local_weights[0])
+            # for key in global_weights.keys():
+            #     for i in range(1, len(local_weights)):
+            #         global_weights[key] += local_weights[i][key]
+            #     global_weights[key] = torch.div(global_weights[key], len(local_weights))
 
             # update global weights
             global_model.load_state_dict(global_weights)
@@ -266,9 +300,9 @@ class GraphBackdoor:
 
                 # feed into GNN, test success rate
                 bkd_acc = evaluate(self.args, bkd_dr_test, model, bkd_gids_test)
-                flip_rate = evaluate(self.args, bkd_dr_test, model, yx_gids)
-                clean_acc = evaluate(self.args, bkd_dr_test, model, clean_graphs_test)
-                print(bkd_acc, flip_rate, clean_acc)
+                flip_rate = evaluate(self.args, bkd_dr_test, cp_model, yx_gids)
+                clean_acc = evaluate(self.args, bkd_dr_test, cp_model, clean_graphs_test)
+                print("Backdoor Accuracy: {}, Clean Accuracy: {}, Flip Rate: {}".format(bkd_acc, flip_rate, clean_acc))
                 if self.args.save_bkd_model:
                     save_path = self.args.bkd_model_save_path
                     os.makedirs(save_path, exist_ok=True)
@@ -338,3 +372,4 @@ if __name__ == '__main__':
     args = parse_args()
     attack = GraphBackdoor(args)
     attack.run()
+
